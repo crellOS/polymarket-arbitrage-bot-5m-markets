@@ -90,6 +90,15 @@ pub struct TokenPrice {
     pub ask: Option<Decimal>,
 }
 
+/// Single-leg position (one order filled, the other failed). Needs redeem when that outcome wins.
+#[derive(Debug, Clone)]
+pub struct PartialPosition {
+    pub symbol: String,
+    pub cid: String,
+    pub outcome: String,
+    pub size: f64,
+}
+
 /// Record of an arb trade for PnL tracking and redeem.
 #[derive(Debug, Clone)]
 pub struct TradeRecord {

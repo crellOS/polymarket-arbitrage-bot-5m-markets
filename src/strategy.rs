@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::discovery::{
     current_15m_period_start, current_5m_period_start, is_last_5min_of_15m, MarketDiscovery,
 };
-use crate::models::{OrderRequest, TradeRecord};
+use crate::models::{PartialPosition, TradeRecord};
 use crate::rtds::PriceCacheMulti;
 use crate::ws::{run_market_ws, PricesSnapshot};
 use anyhow::Result;
@@ -23,6 +23,7 @@ const RESOLUTION_INITIAL_DELAY_SECS: u64 = 60;
 const LIVE_PRICE_POLL_MS: u64 = 10;
 const OVERLAP_POLL_SECS: u64 = 5;
 const WAIT_FOR_PRICE_POLL_SECS: u64 = 10;
+const NO_ARB_STATUS_LOG_SECS: u64 = 30;
 
 pub struct ArbStrategy {
     api: Arc<PolymarketApi>,
@@ -155,7 +156,7 @@ impl ArbStrategy {
         t5_down: &str,
         period_15: i64,
         period_5: i64,
-    ) -> Result<Vec<TradeRecord>> {
+    ) -> Result<(Vec<TradeRecord>, Vec<PartialPosition>)> {
         let prices: PricesSnapshot = Arc::new(RwLock::new(HashMap::new()));
         let asset_ids = vec![
             t15_up.to_string(),
@@ -179,7 +180,9 @@ impl ArbStrategy {
         let sym_upper = symbol.to_uppercase();
 
         let mut last_trade_at: Option<std::time::Instant> = None;
+        let mut last_status_log: Option<std::time::Instant> = None;
         let mut trades: Vec<TradeRecord> = Vec::new();
+        let mut partials: Vec<PartialPosition> = Vec::new();
 
         while Utc::now().timestamp() < period_15 + MARKET_15M_DURATION_SECS {
             let snap = prices.read().await;
@@ -217,6 +220,22 @@ impl ArbStrategy {
                         cid_15, "Down", cid_5, "Up",
                     )
                 } else {
+                    let should_log = last_status_log
+                        .map(|t| t.elapsed().as_secs() >= NO_ARB_STATUS_LOG_SECS)
+                        .unwrap_or(true);
+                    if should_log {
+                        let sum_ud = sum_up_down.map(|s| format!("{:.4}", s)).unwrap_or_else(|| "?".to_string());
+                        let sum_du = sum_down_up.map(|s| format!("{:.4}", s)).unwrap_or_else(|| "?".to_string());
+                        let a15u = ask_15_up.map(|a| format!("{:.4}", a)).unwrap_or_else(|| "?".to_string());
+                        let a15d = ask_15_down.map(|a| format!("{:.4}", a)).unwrap_or_else(|| "?".to_string());
+                        let a5u = ask_5_up.map(|a| format!("{:.4}", a)).unwrap_or_else(|| "?".to_string());
+                        let a5d = ask_5_down.map(|a| format!("{:.4}", a)).unwrap_or_else(|| "?".to_string());
+                        info!(
+                            "{} overlap: no arb yet | 15m Up={} Down={} 5m Up={} Down={} | sum(Up+Down)={} sum(Down+Up)={} threshold={}",
+                            sym_upper, a15u, a15d, a5u, a5d, sum_ud, sum_du, threshold
+                        );
+                        last_status_log = Some(std::time::Instant::now());
+                    }
                     sleep(Duration::from_millis(LIVE_PRICE_POLL_MS)).await;
                     continue;
                 };
@@ -227,6 +246,7 @@ impl ArbStrategy {
                     sym_upper, leg1_outcome, leg1_price, leg2_outcome, leg2_price, leg1_price + leg2_price, threshold
                 );
                 last_trade_at = Some(std::time::Instant::now());
+                last_status_log = None;
                 let size_f64: f64 = shares.parse().unwrap_or(0.0);
                 trades.push(TradeRecord {
                     symbol: symbol.to_string(),
@@ -248,23 +268,13 @@ impl ArbStrategy {
                 continue;
             }
 
-            let order1 = OrderRequest {
-                token_id: leg1_token.to_string(),
-                side: "BUY".to_string(),
-                size: shares.clone(),
-                price: format!("{:.4}", leg1_price),
-                order_type: "GTC".to_string(),
-            };
-            let order2 = OrderRequest {
-                token_id: leg2_token.to_string(),
-                side: "BUY".to_string(),
-                size: shares.clone(),
-                price: format!("{:.4}", leg2_price),
-                order_type: "GTC".to_string(),
-            };
+            let size_f64: f64 = shares.parse().unwrap_or(0.0);
 
-            let r1 = self.api.place_order(&order1).await;
-            let r2 = self.api.place_order(&order2).await;
+            // Place both legs in parallel for faster execution when arb opportunity appears
+            let (r1, r2) = tokio::join!(
+                self.api.place_market_order(leg1_token, size_f64, "BUY", Some("FAK")),
+                self.api.place_market_order(leg2_token, size_f64, "BUY", Some("FAK")),
+            );
 
             match (&r1, &r2) {
                 (Ok(res1), Ok(res2)) => {
@@ -275,6 +285,7 @@ impl ArbStrategy {
                         sym_upper, leg1_outcome, leg1_price, id1, leg2_outcome, leg2_price, id2, interval_secs
                     );
                     last_trade_at = Some(std::time::Instant::now());
+                    last_status_log = None;
                     let size_f64: f64 = shares.parse().unwrap_or(0.0);
                     trades.push(TradeRecord {
                         symbol: symbol.to_string(),
@@ -293,11 +304,28 @@ impl ArbStrategy {
                         size: size_f64,
                     });
                 }
-                (Err(e), _) => {
-                    warn!("{} arb leg1 place failed: {}", sym_upper, e);
+                (Ok(_), Err(e)) => {
+                    warn!("{} arb leg2 place failed (leg1 filled): {}", sym_upper, e);
+                    let size_f64: f64 = shares.parse().unwrap_or(0.0);
+                    partials.push(PartialPosition {
+                        symbol: symbol.to_string(),
+                        cid: cid_15.to_string(),
+                        outcome: leg1_outcome.to_string(),
+                        size: size_f64,
+                    });
                 }
-                (_, Err(e)) => {
-                    warn!("{} arb leg2 place failed: {}", sym_upper, e);
+                (Err(e), Ok(_)) => {
+                    warn!("{} arb leg1 place failed (leg2 filled): {}", sym_upper, e);
+                    let size_f64: f64 = shares.parse().unwrap_or(0.0);
+                    partials.push(PartialPosition {
+                        symbol: symbol.to_string(),
+                        cid: cid_5.to_string(),
+                        outcome: leg2_outcome.to_string(),
+                        size: size_f64,
+                    });
+                }
+                (Err(e), Err(_)) => {
+                    warn!("{} arb leg1 place failed: {}", sym_upper, e);
                 }
             }
 
@@ -305,29 +333,31 @@ impl ArbStrategy {
         }
 
         ws_handle.abort();
-        info!("{} overlap window ended (period {}), {} trade(s) placed.", sym_upper, period_15, trades.len());
-        Ok(trades)
+        info!(
+            "{} overlap window ended (period {}), {} complete arb(s), {} partial(s).",
+            sym_upper, period_15, trades.len(), partials.len()
+        );
+        Ok((trades, partials))
     }
 
     /// Poll until markets are closed/resolved, compute PnL, redeem winning tokens. Updates cumulative_pnl.
+    /// Also redeems partial positions and sweeps all redeemable positions via API.
     async fn resolve_and_redeem(
         api: Arc<PolymarketApi>,
         config: &Config,
+        cid_15: &str,
+        cid_5: &str,
         trades: Vec<TradeRecord>,
+        partials: Vec<PartialPosition>,
         cumulative_pnl: Arc<RwLock<f64>>,
     ) -> Result<()> {
-        if trades.is_empty() {
+        if trades.is_empty() && partials.is_empty() {
             return Ok(());
         }
         let poll_interval = config.strategy.resolution_poll_interval_secs;
-        let max_wait = config.strategy.resolution_max_wait_secs;
         let auto_redeem = config.strategy.auto_redeem;
         let proxy = config.polymarket.proxy_wallet_address.as_deref();
-
-        let first = trades.first().unwrap();
-        let cid_15 = &first.cid_15;
-        let cid_5 = &first.cid_5;
-        info!("Resolution: waiting {}s, then polling every {}s (max {}s) for {} trade(s).", RESOLUTION_INITIAL_DELAY_SECS, poll_interval, max_wait, trades.len());
+        info!("Resolution: waiting {}s, then polling every {}s until markets close (no timeout).", RESOLUTION_INITIAL_DELAY_SECS, poll_interval);
         sleep(Duration::from_secs(RESOLUTION_INITIAL_DELAY_SECS)).await;
 
         let started = std::time::Instant::now();
@@ -335,15 +365,31 @@ impl ArbStrategy {
         let mut m15_resolved = None;
         let mut m5_resolved = None;
 
-        while started.elapsed().as_secs() < max_wait {
+        let sym = trades
+            .first()
+            .map(|t| t.symbol.to_uppercase())
+            .or_else(|| partials.first().map(|p| p.symbol.to_uppercase()))
+            .unwrap_or_else(|| "?".to_string());
+        let mut poll_count = 0u32;
+
+        loop {
+            poll_count += 1;
             let m15 = api.get_market(cid_15).await.ok();
             let m5 = api.get_market(cid_5).await.ok();
             let (closed_15, winner_15) = m15.as_ref().map(|m| (m.closed, m.tokens.iter().find(|t| t.winner).map(|t| (t.token_id.as_str(), t.outcome.as_str())))).unwrap_or((false, None));
             let (closed_5, winner_5) = m5.as_ref().map(|m| (m.closed, m.tokens.iter().find(|t| t.winner).map(|t| (t.token_id.as_str(), t.outcome.as_str())))).unwrap_or((false, None));
+            let elapsed = started.elapsed().as_secs();
+            let w15 = winner_15.map(|(_, o)| o).unwrap_or("?");
+            let w5 = winner_5.map(|(_, o)| o).unwrap_or("?");
+            info!(
+                "{} resolution poll #{} ({}s): 15m closed={} winner={} 5m closed={} winner={}",
+                sym, poll_count, elapsed, closed_15, w15, closed_5, w5
+            );
 
             if closed_15 && closed_5 && winner_15.is_some() && winner_5.is_some() {
                 m15_resolved = m15;
                 m5_resolved = m5;
+                info!("{} markets resolved. Computing PnL and redeeming.", sym);
                 break;
             }
             sleep(Duration::from_secs(poll_interval)).await;
@@ -354,10 +400,7 @@ impl ArbStrategy {
                 m15.tokens.iter().find(|t| t.winner).map(|t| (t.token_id.as_str(), t.outcome.as_str())),
                 m5.tokens.iter().find(|t| t.winner).map(|t| (t.token_id.as_str(), t.outcome.as_str())),
             ),
-            _ => {
-                warn!("Resolution timeout for {} trades (cid_15={}, cid_5={}).", trades.len(), cid_15, cid_5);
-                return Ok(());
-            }
+            _ => unreachable!("loop breaks only when both resolved"),
         };
 
         let (win_token_15, win_token_5, outcome_15, outcome_5) = match (winner_15, winner_5) {
@@ -365,15 +408,30 @@ impl ArbStrategy {
             _ => return Ok(()),
         };
 
+        let period_15 = trades.first().map(|t| t.period_15).unwrap_or(0_i64);
+
+        let mut total_deposit = 0.0;
+        let mut total_payout = 0.0;
+        let mut wins_both = 0usize;
+        let mut wins_one = 0usize;
+        let mut losses = 0usize;
+
         for trade in &trades {
-            let sym = trade.symbol.to_uppercase();
             let cost = (trade.leg1_price + trade.leg2_price) * trade.size;
+            total_deposit += cost;
             // We bought 15m one + 5m opposite. Check which legs won ($1 each).
             let we_won_15m = win_token_15 == trade.leg1_token || win_token_15 == trade.leg2_token;
             let we_won_5m = win_token_5 == trade.leg1_token || win_token_5 == trade.leg2_token;
             let payout = trade.size * ((we_won_15m as i32 + we_won_5m as i32) as f64);
+            total_payout += payout;
             let pnl = payout - cost;
             period_pnl += pnl;
+
+            match (we_won_15m, we_won_5m) {
+                (true, true) => wins_both += 1,
+                (true, false) | (false, true) => wins_one += 1,
+                (false, false) => losses += 1,
+            }
 
             let result_msg = match (we_won_15m, we_won_5m) {
                 (true, true) => "Won both legs",
@@ -382,36 +440,106 @@ impl ArbStrategy {
                 (false, false) => "Lost both legs",
             };
             info!(
-                "{} resolved: Won 15m {} 5m {} | {} | cost={:.2}, payout={:.2}, PnL={:.2} | period PnL={:.2}",
-                sym, outcome_15, outcome_5, result_msg, cost, payout, pnl, period_pnl
+                "  {} #{}: {} | cost={:.2}, payout={:.2}, PnL={:.2}",
+                sym, wins_both + wins_one + losses, result_msg, cost, payout, pnl
             );
 
-            // Redeem winning tokens (one or both legs)
+            // Redeem winning tokens (one or both legs). Retry until success.
             if auto_redeem && proxy.is_some() && !config.strategy.simulation_mode {
                 if we_won_15m {
                     let out = if win_token_15 == trade.leg1_token { &trade.leg1_outcome } else { &trade.leg2_outcome };
-                    if let Err(e) = api.redeem_tokens(trade.cid_15.as_str(), "", out).await {
-                        warn!("  Redeem 15m failed: {}", e);
-                    } else {
-                        info!("  Redeemed 15m {} tokens", out);
+                    loop {
+                        match api.redeem_tokens(trade.cid_15.as_str(), "", out).await {
+                            Ok(_) => {
+                                info!("    Redeemed 15m {} tokens", out);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("  Redeem 15m {} failed: {}. Retrying in 30s.", out, e);
+                                sleep(Duration::from_secs(30)).await;
+                            }
+                        }
                     }
                 }
                 if we_won_5m {
                     let out = if win_token_5 == trade.leg1_token { &trade.leg1_outcome } else { &trade.leg2_outcome };
-                    if let Err(e) = api.redeem_tokens(trade.cid_5.as_str(), "", out).await {
-                        warn!("  Redeem 5m failed: {}", e);
-                    } else {
-                        info!("  Redeemed 5m {} tokens", out);
+                    loop {
+                        match api.redeem_tokens(trade.cid_5.as_str(), "", out).await {
+                            Ok(_) => {
+                                info!("    Redeemed 5m {} tokens", out);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("  Redeem 5m {} failed: {}. Retrying in 30s.", out, e);
+                                sleep(Duration::from_secs(30)).await;
+                            }
+                        }
                     }
                 }
             }
         }
 
-        if period_pnl != 0.0 {
-            let mut cum = cumulative_pnl.write().await;
-            *cum += period_pnl;
-            info!("Period PnL: {:.2} | Cumulative PnL: {:.2}", period_pnl, *cum);
+        // Redeem partial positions (single leg that won)
+        for p in &partials {
+            let won = (p.cid == *cid_15 && p.outcome == outcome_15) || (p.cid == *cid_5 && p.outcome == outcome_5);
+            if won && auto_redeem && proxy.is_some() && !config.strategy.simulation_mode {
+                loop {
+                    match api.redeem_tokens(&p.cid, "", &p.outcome).await {
+                        Ok(_) => {
+                            info!("    Redeemed partial {} {} tokens ({} shares)", p.symbol.to_uppercase(), p.outcome, p.size);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("  Redeem partial {} failed: {}. Retrying in 30s.", p.outcome, e);
+                            sleep(Duration::from_secs(30)).await;
+                        }
+                    }
+                }
+            }
         }
+
+        // Sweep: redeem ALL remaining redeemable positions (catches any we missed)
+        if auto_redeem && proxy.is_some() && !config.strategy.simulation_mode {
+            if let Some(proxy_addr) = proxy {
+                if let Ok(condition_ids) = api.get_redeemable_positions(proxy_addr).await {
+                    if !condition_ids.is_empty() {
+                        info!("Sweep: {} redeemable condition(s) remaining. Redeeming all.", condition_ids.len());
+                        for cid in &condition_ids {
+                            let m = match api.get_market(cid).await {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    warn!("Sweep: could not get market {}: {}", &cid[..cid.len().min(18)], e);
+                                    continue;
+                                }
+                            };
+                            let winner = m.tokens.iter().find(|t| t.winner).map(|t| t.outcome.as_str());
+                            if let Some(outcome) = winner {
+                                loop {
+                                    match api.redeem_tokens(cid, "", outcome).await {
+                                        Ok(_) => {
+                                            info!("    Sweep redeemed condition {} (winner {})", &cid[..cid.len().min(18)], outcome);
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!("Sweep redeem failed: {}. Retrying in 30s.", e);
+                                            sleep(Duration::from_secs(30)).await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cum = cumulative_pnl.write().await;
+        *cum += period_pnl;
+        info!(
+            "{} PERIOD {} SUMMARY: Market Won 15m {} 5m {} | deposit={:.2}, payout={:.2} | trades={} ({} both, {} one, {} lost), partials={} | period PnL={:.2} | cumulative PnL={:.2}",
+            sym, period_15, outcome_15, outcome_5, total_deposit, total_payout,
+            trades.len(), wins_both, wins_one, losses, partials.len(), period_pnl, *cum
+        );
         Ok(())
     }
 
@@ -445,9 +573,19 @@ impl ArbStrategy {
                 )
                 .await
             {
-                Ok(trades) => {
-                    if !trades.is_empty() {
-                        if let Err(e) = Self::resolve_and_redeem(api.clone(), &config, trades, cumulative_pnl.clone()).await {
+                Ok((trades, partials)) => {
+                    if !trades.is_empty() || !partials.is_empty() {
+                        if let Err(e) = Self::resolve_and_redeem(
+                            api.clone(),
+                            &config,
+                            &cid_15,
+                            &cid_5,
+                            trades,
+                            partials,
+                            cumulative_pnl.clone(),
+                        )
+                        .await
+                        {
                             error!("{} resolve/redeem error: {}", symbol.to_uppercase(), e);
                         }
                     }

@@ -50,9 +50,6 @@ pub struct StrategyConfig {
     /// Seconds between polls when checking if markets are closed/resolved (e.g. 30).
     #[serde(default = "default_resolution_poll_interval_secs")]
     pub resolution_poll_interval_secs: u64,
-    /// Max seconds to wait for resolution before giving up (e.g. 600 = 10 min).
-    #[serde(default = "default_resolution_max_wait_secs")]
-    pub resolution_max_wait_secs: u64,
     /// Automatically redeem winning tokens after resolution.
     #[serde(default = "default_auto_redeem")]
     pub auto_redeem: bool,
@@ -80,10 +77,7 @@ fn default_xrp_tolerance() -> f64 {
     0.0003
 }
 fn default_resolution_poll_interval_secs() -> u64 {
-    30
-}
-fn default_resolution_max_wait_secs() -> u64 {
-    600
+    20
 }
 fn default_auto_redeem() -> bool {
     true
@@ -158,7 +152,6 @@ impl Default for Config {
                 sol_price_to_beat_tolerance_usd: default_sol_tolerance(),
                 xrp_price_to_beat_tolerance_usd: default_xrp_tolerance(),
                 resolution_poll_interval_secs: default_resolution_poll_interval_secs(),
-                resolution_max_wait_secs: default_resolution_max_wait_secs(),
                 auto_redeem: default_auto_redeem(),
             },
         }

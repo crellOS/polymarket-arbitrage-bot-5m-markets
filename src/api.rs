@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 // Official SDK imports for proper order signing
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
-use polymarket_client_sdk::clob::types::{Side, OrderType, SignatureType};
+use polymarket_client_sdk::clob::types::{Amount, Side, OrderType, SignatureType};
 use polymarket_client_sdk::POLYGON;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer as _;
@@ -452,17 +452,7 @@ impl PolymarketApi {
             Err(e) => {
                 // Log the full error details for debugging
                 error!("❌ Failed to post order. Error details: {:?}", e);
-                anyhow::bail!(
-                    "Failed to post order: {}\n\
-                    \n\
-                    Troubleshooting:\n\
-                    1. Check if you have sufficient USDC balance\n\
-                    2. Verify the token_id is valid and active\n\
-                    3. Check if the price is within valid range\n\
-                    4. Ensure your API credentials have trading permissions\n\
-                    5. Verify the order size meets minimum requirements",
-                    e
-                );
+                anyhow::bail!( "Failed to post order. Error details: {:?}", e);
             }
         };
         
@@ -500,13 +490,13 @@ impl PolymarketApi {
         Ok(order_response)
     }
 
-    // Place a market order (FOK/FAK) for immediate execution
+    // Place a market order (FOK/FAK) for immediate execution using SDK market_order().
     pub async fn place_market_order(
         &self,
         token_id: &str,
-        amount: f64,
+        amount_shares: f64,
         side: &str,
-        order_type: Option<&str>, // "FOK" or "FAK", defaults to FOK
+        order_type: Option<&str>, // "FOK" or "FAK", defaults to FAK
     ) -> Result<OrderResponse> {
         let private_key = self.private_key.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
@@ -554,114 +544,52 @@ impl PolymarketApi {
             _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", side),
         };
         
-        let order_type_enum = match order_type.unwrap_or("FOK") {
+        let order_type_enum = match order_type.unwrap_or("FAK") {
             "FOK" => OrderType::FOK,
             "FAK" => OrderType::FAK,
-            _ => OrderType::FOK, // Default to FOK
+            _ => OrderType::FAK, // Default to FAK
         };
         
         use rust_decimal::{Decimal, RoundingStrategy};
         use rust_decimal::prelude::*;
         
-        let amount_decimal = Decimal::from_f64_retain(amount)
+        let amount_decimal = Decimal::from_f64_retain(amount_shares)
             .ok_or_else(|| anyhow::anyhow!("Failed to convert amount to Decimal"))?
             .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero);
         
-        eprintln!("📤 Creating and posting MARKET order: {} {} {} (type: {:?})", 
-              side, amount_decimal, token_id, order_type_enum);
+        let amount = Amount::shares(amount_decimal)
+            .map_err(|e| anyhow::anyhow!("Invalid amount for shares: {}", e))?;
         
-        let market_price = if matches!(side_enum, Side::Buy) {
-            self.get_price(token_id, "SELL")
-                .await
-                .context("Failed to fetch ASK price for BUY order")?
-        } else {
-            // For SELL orders, get the BID price (what buyers are bidding - lower price)
-            self.get_price(token_id, "BUY")
-                .await
-                .context("Failed to fetch BID price for SELL order")?
-        };
-        
-        eprintln!("   Using current market price: ${:.4} for {} order", market_price, side);
-
         let token_id_u256 = if token_id.starts_with("0x") {
             U256::from_str_radix(token_id.trim_start_matches("0x"), 16)
         } else {
             U256::from_str_radix(token_id, 10)
         }.context(format!("Failed to parse token_id as U256: {}", token_id))?;
+        
+        eprintln!("📤 Creating and posting MARKET order: {} {} shares {} (type: {:?})",
+              side, amount_decimal, token_id, order_type_enum);
 
-        let order_builder = client
-            .limit_order()
+        let order = client
+            .market_order()
             .token_id(token_id_u256)
-            .size(amount_decimal)
-            .price(market_price)
-            .side(side_enum);
-        
-        let signed_order = client.sign(&signer, order_builder.build().await?)
+            .amount(amount)
+            .side(side_enum)
+            .order_type(order_type_enum)
+            .build()
             .await
+            .context("Failed to build market order (SDK fetches orderbook for price)")?;
+        
+        let signed_order = client.sign(&signer, order).await
             .context("Failed to sign market order")?;
-        
-        let final_price = if matches!(side_enum, Side::Sell) {
-            let price_f64 = f64::try_from(market_price).unwrap_or(0.0);
-            let adjusted_f64 = price_f64 * 0.995;
-            let rounded_f64 = (adjusted_f64 * 100.0).round() / 100.0;
-            let final_f64 = rounded_f64.max(0.01);
-            Decimal::from_f64_retain(final_f64)
-                .ok_or_else(|| anyhow::anyhow!("Failed to convert adjusted price to Decimal"))?
-                .round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
-        } else {
-            // For BUY orders, also ensure 2 decimal places
-            market_price.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
-        };
-        
-        // If price was adjusted, rebuild the order
-        let signed_order = if matches!(side_enum, Side::Sell) && final_price != market_price {
-            let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
-            let market_price_f64 = f64::try_from(market_price).unwrap_or(0.0);
-            eprintln!("   ⚠️  Adjusting SELL price from ${:.4} to ${:.4} for immediate execution", market_price_f64, final_price_f64);
-            let adjusted_builder = client
-                .limit_order()
-                .token_id(token_id_u256)
-                .size(amount_decimal)
-                .price(final_price)
-                .side(side_enum);
-            client.sign(&signer, adjusted_builder.build().await?)
-                .await
-                .context("Failed to sign adjusted market order")?
-        } else {
-            signed_order
-        };
-        
-        // Log detailed order info before posting
-        let final_price_f64 = f64::try_from(final_price).unwrap_or(0.0);
-        eprintln!("   📋 Order details: Side={}, Size={}, Price=${:.4}, Token={}", 
-              side, amount_decimal, final_price_f64, token_id);
         
         let response = match client.post_order(signed_order).await {
             Ok(resp) => resp,
             Err(e) => {
-                // Log the full error for debugging
                 error!("❌ SDK post_order error: {:?}", e);
-                anyhow::bail!(
-                    "Failed to post market order: {:?}\n\
-                    \n\
-                    Order details:\n\
-                    - Side: {}\n\
-                    - Token ID: {}\n\
-                    - Size: {}\n\
-                    - Price: ${:.4}\n\
-                    \n\
-                    Troubleshooting:\n\
-                    1. For SELL orders: Verify you own sufficient tokens (check token balance)\n\
-                    2. For BUY orders: Verify you have sufficient USDC balance\n\
-                    3. Check if token_id is valid and market is active\n\
-                    4. Verify price is within valid range (not too low/high)\n\
-                    5. Check if order size meets minimum requirements",
-                    e, side, token_id, amount_decimal, final_price_f64
-                );
+                anyhow::bail!("Failed to post market order. Error details: {:?}", e);
             }
         };
         
-        // Convert SDK response to our OrderResponse format
         let order_response = OrderResponse {
             order_id: Some(response.order_id.clone()),
             status: response.status.to_string(),
@@ -682,20 +610,18 @@ impl PolymarketApi {
                 Order ID: {}\n\
                 Token ID: {}\n\
                 Side: {}\n\
-                Size: {}\n\
-                Price: ${:.4}\n\
+                Size: {} shares\n\
                 \n\
                 Possible reasons:\n\
                 1. Insufficient balance or allowance\n\
                 2. Order size too small (minimum may be required)\n\
-                3. Price moved or insufficient liquidity\n\
+                3. Insufficient liquidity (FAK: partial fill; FOK: needs full fill)\n\
                 4. Market closed or token inactive",
                 error_msg,
                 response.order_id,
                 token_id,
                 side,
-                amount_decimal,
-                final_price_f64
+                amount_decimal
             );
         }
     }
@@ -784,14 +710,7 @@ impl PolymarketApi {
             
             if status == 401 || status == 403 {
                 anyhow::bail!(
-                    "Authentication failed (status: {}): {}\n\
-                    Troubleshooting:\n\
-                    1. Verify your API credentials (api_key, api_secret, api_passphrase) are correct\n\
-                    2. Verify your private_key is correct (required for order signing)\n\
-                    3. Check if your API key has trading permissions\n\
-                    4. Ensure your account has sufficient balance",
-                    status, error_text
-                );
+                    "Authentication failed (status: {}): {}", status, error_text);
             }
             
             anyhow::bail!("Failed to place order (status: {}): {}", status, error_text);
