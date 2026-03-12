@@ -141,6 +141,25 @@ impl PolymarketApi {
         Ok(())
     }
 
+    pub fn gamma_url(&self) -> &str {
+        &self.gamma_url
+    }
+
+    /// Fetch events from Gamma API (full URL). Returns array of event objects.
+    pub async fn fetch_gamma_events(&self, url: &str) -> Result<Vec<serde_json::Value>> {
+        let response = self.client.get(url).send().await
+            .context("Failed to fetch Gamma events")?;
+        if !response.status().is_success() {
+            anyhow::bail!("Gamma API returned status {}", response.status());
+        }
+        let json: serde_json::Value = response.json().await
+            .context("Failed to parse Gamma response")?;
+        let arr = json.as_array()
+            .cloned()
+            .unwrap_or_else(|| vec![json]);
+        Ok(arr)
+    }
+
     /// Generate HMAC-SHA256 signature for authenticated requests
     fn generate_signature(
         &self,
@@ -197,297 +216,6 @@ impl PolymarketApi {
             .header("POLY_PASSPHRASE", self.api_passphrase.as_ref().unwrap());
         
         Ok(request)
-    }
-
-    // Get market by slug (e.g., "btc-updown-15m-1767726000")
-    pub async fn get_market_by_slug(&self, slug: &str) -> Result<Market> {
-        let url = format!("{}/events/slug/{}", self.gamma_url, slug);
-        
-        let response = self.client.get(&url).send().await
-            .context(format!("Failed to fetch market by slug: {}", slug))?;
-        
-        let status = response.status();
-        if !status.is_success() {
-            anyhow::bail!("Failed to fetch market by slug: {} (status: {})", slug, status);
-        }
-        
-        let json: Value = response.json().await
-            .context("Failed to parse market response")?;
-        
-        if let Some(markets) = json.get("markets").and_then(|m| m.as_array()) {
-            if let Some(market_json) = markets.first() {
-                if let Ok(market) = serde_json::from_value::<Market>(market_json.clone()) {
-                    return Ok(market);
-                }
-            }
-        }
-        
-        anyhow::bail!("Invalid market response format: no markets array found")
-    }
-
-    /// Fetch price-to-beat (openPrice) from Polymarket crypto-price API.
-    /// Not available immediately at market start: 15m ~2 min, 5m ~30 sec. Call after delay and poll.
-    /// variant: "fifteen" for 15m market, "fiveminute" for 5m market (per Polymarket platform).
-    /// event_start_iso and end_date_iso must be ISO 8601 UTC with Z (e.g. "2026-02-14T13:45:00Z").
-    pub async fn get_crypto_price_to_beat(
-        &self,
-        symbol: &str,
-        event_start_iso: &str,
-        variant: &str,
-        end_date_iso: &str,
-    ) -> Result<Option<f64>> {
-        const CRYPTO_PRICE_URL: &str = "https://polymarket.com/api/crypto/crypto-price";
-        let req = self
-            .client
-            .get(CRYPTO_PRICE_URL)
-            .query(&[
-                ("symbol", symbol),
-                ("eventStartTime", event_start_iso),
-                ("variant", variant),
-                ("endDate", end_date_iso),
-            ])
-            .build()
-            .context("Failed to build crypto price-to-beat request")?;
-        let response = self
-            .client
-            .execute(req)
-            .await
-            .context("Failed to fetch crypto price-to-beat")?;
-        if !response.status().is_success() {
-            return Ok(None);
-        }
-        let json: Value = response.json().await.context("Parse crypto-price response")?;
-        let open_price = json
-            .get("openPrice")
-            .and_then(|v| v.as_f64())
-            .or_else(|| json.get("openPrice").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()));
-        Ok(open_price)
-    }
-
-    // Get order book for a specific token
-    pub async fn get_orderbook(&self, token_id: &str) -> Result<OrderBook> {
-        let url = format!("{}/book", self.clob_url);
-        let params = [("token_id", token_id)];
-
-        let response = self
-            .client
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .context("Failed to fetch orderbook")?;
-
-        let orderbook: OrderBook = response
-            .json()
-            .await
-            .context("Failed to parse orderbook")?;
-
-        Ok(orderbook)
-    }
-
-    /// Get market details by condition ID
-    pub async fn get_market(&self, condition_id: &str) -> Result<MarketDetails> {
-        let url = format!("{}/markets/{}", self.clob_url, condition_id);
-
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context(format!("Failed to fetch market for condition_id: {}", condition_id))?;
-
-        let status = response.status();
-        
-        if !status.is_success() {
-            anyhow::bail!("Failed to fetch market (status: {})", status);
-        }
-
-        let json_text = response.text().await
-            .context("Failed to read response body")?;
-
-        let market: MarketDetails = serde_json::from_str(&json_text)
-            .map_err(|e| {
-                log::error!("Failed to parse market response: {}. Response was: {}", e, json_text);
-                anyhow::anyhow!("Failed to parse market response: {}", e)
-            })?;
-
-        Ok(market)
-    }
-
-    // Get price for a token (for trading)
-    pub async fn get_price(&self, token_id: &str, side: &str) -> Result<rust_decimal::Decimal> {
-        let url = format!("{}/price", self.clob_url);
-        let params = [
-            ("side", side),
-            ("token_id", token_id),
-        ];
-
-        log::debug!("Fetching price from: {}?side={}&token_id={}", url, side, token_id);
-
-        let response = self
-            .client
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .context("Failed to fetch price")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            anyhow::bail!("Failed to fetch price (status: {})", status);
-        }
-
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse price response")?;
-
-        let price_str = json.get("price")
-            .and_then(|p| p.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Invalid price response format"))?;
-
-        let price = rust_decimal::Decimal::from_str(price_str)
-            .context(format!("Failed to parse price: {}", price_str))?;
-
-        log::debug!("Price for token {} (side={}): {}", token_id, side, price);
-
-        Ok(price)
-    }
-
-    // Get best bid/ask prices for a token (from orderbook)
-    pub async fn get_best_price(&self, token_id: &str) -> Result<Option<TokenPrice>> {
-        let orderbook = self.get_orderbook(token_id).await?;
-        
-        let best_bid = orderbook.bids.first().map(|b| b.price);
-        let best_ask = orderbook.asks.first().map(|a| a.price);
-
-        if best_ask.is_some() {
-            Ok(Some(TokenPrice {
-                token_id: token_id.to_string(),
-                bid: best_bid,
-                ask: best_ask,
-            }))
-        } else {
-            Ok(None)
-        }
-    }
-
-    // Place an order
-    pub async fn place_order(&self, order: &OrderRequest) -> Result<OrderResponse> {
-        let private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for order signing. Please set private_key in config.json"))?;
-        
-        let signer = LocalSigner::from_str(private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
-        
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
-            auth_builder = auth_builder.funder(funder_address);
-            
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => SignatureType::Proxy, // Default to Proxy when proxy wallet is set
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            // If signature type is set but no proxy wallet, validate it's EOA
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        // Create CLOB client with authentication
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
-        
-        let side = match order.side.as_str() {
-            "BUY" => Side::Buy,
-            "SELL" => Side::Sell,
-            _ => anyhow::bail!("Invalid order side: {}. Must be 'BUY' or 'SELL'", order.side),
-        };
-        
-        let price = rust_decimal::Decimal::from_str(&order.price)
-            .context(format!("Failed to parse price: {}", order.price))?;
-        let size = rust_decimal::Decimal::from_str(&order.size)
-            .context(format!("Failed to parse size: {}", order.size))?;
-        
-        eprintln!("📤 Creating and posting order: {} {} {} @ {}", 
-              order.side, order.size, order.token_id, order.price);
-
-        let token_id_u256 = if order.token_id.starts_with("0x") {
-            U256::from_str_radix(order.token_id.trim_start_matches("0x"), 16)
-        } else {
-            U256::from_str_radix(&order.token_id, 10)
-        }.context(format!("Failed to parse token_id as U256: {}", order.token_id))?;
-
-        let order_builder = client
-            .limit_order()
-            .token_id(token_id_u256)
-            .size(size)
-            .price(price)
-            .side(side);
-        
-        let signed_order = client.sign(&signer, order_builder.build().await?)
-            .await
-            .context("Failed to sign order")?;
-        
-        // Post order and capture detailed error information
-        let response = match client.post_order(signed_order).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                // Log the full error details for debugging
-                error!("❌ Failed to post order. Error details: {:?}", e);
-                anyhow::bail!( "Failed to post order. Error details: {:?}", e);
-            }
-        };
-        
-        // Check if the response indicates failure even if the request succeeded
-        if !response.success {
-            let error_msg = response.error_msg.as_deref().unwrap_or("Unknown error");
-            error!("❌ Order rejected by API: {}", error_msg);
-            anyhow::bail!(
-                "Order was rejected: {}\n\
-                \n\
-                Order details:\n\
-                - Token ID: {}\n\
-                - Side: {}\n\
-                - Size: {}\n\
-                - Price: {}\n\
-                \n\
-                Common issues:\n\
-                1. Insufficient balance or allowance\n\
-                2. Invalid token ID or market closed\n\
-                3. Price out of range\n\
-                4. Size below minimum or above maximum",
-                error_msg, order.token_id, order.side, order.size, order.price
-            );
-        }
-        
-        // Convert SDK response to our OrderResponse format
-        let order_response = OrderResponse {
-            order_id: Some(response.order_id.clone()),
-            status: response.status.to_string(),
-            message: Some(format!("Order placed successfully. Order ID: {}", response.order_id)),
-        };
-        
-        eprintln!("✅ Order placed successfully! Order ID: {}", response.order_id);
-        
-        Ok(order_response)
     }
 
     // Place a market order (FOK/FAK) for immediate execution using SDK market_order().
@@ -625,64 +353,7 @@ impl PolymarketApi {
             );
         }
     }
-    
-    /// Cancel an order by order ID
-    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
-        let _private_key = self.private_key.as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Private key is required for order cancellation. Please set private_key in config.json"))?;
-        
-        let signer = LocalSigner::from_str(_private_key)
-            .context("Failed to create signer from private key. Ensure private_key is a valid hex string.")?
-            .with_chain_id(Some(POLYGON));
-        
-        let mut auth_builder = ClobClient::new(&self.clob_url, ClobConfig::default())
-            .context("Failed to create CLOB client")?
-            .authentication_builder(&signer);
-        
-        if let Some(proxy_addr) = &self.proxy_wallet_address {
-            let funder_address = AlloyAddress::parse_checksummed(proxy_addr, None)
-                .context(format!("Failed to parse proxy_wallet_address: {}. Ensure it's a valid Ethereum address.", proxy_addr))?;
-            
-            auth_builder = auth_builder.funder(funder_address);
-            
-            let sig_type = match self.signature_type {
-                Some(1) => SignatureType::Proxy,
-                Some(2) => SignatureType::GnosisSafe,
-                Some(0) | None => SignatureType::Proxy,
-                Some(n) => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        } else if let Some(sig_type_num) = self.signature_type {
-            let sig_type = match sig_type_num {
-                0 => SignatureType::Eoa,
-                1 | 2 => anyhow::bail!("signature_type {} requires proxy_wallet_address to be set", sig_type_num),
-                n => anyhow::bail!("Invalid signature_type: {}. Must be 0 (EOA), 1 (Proxy), or 2 (GnosisSafe)", n),
-            };
-            auth_builder = auth_builder.signature_type(sig_type);
-        }
-        
-        let client = auth_builder
-            .authenticate()
-            .await
-            .context("Failed to authenticate with CLOB API. Check your API credentials.")?;
-        
-        client.cancel_order(order_id).await
-            .context(format!("Failed to cancel order {}", order_id))?;
-        
-        Ok(())
-    }
-
-    /// Fetch order status (e.g. size_matched) to verify fill. Uses data API.
-    pub async fn get_order_status(&self, order_id: &str) -> Result<OrderStatus> {
-        let url = format!("https://data-api.polymarket.com/order/{}", order_id.trim_start_matches("0x"));
-        let response = self.client.get(&url).send().await.context("Failed to fetch order status")?;
-        if !response.status().is_success() {
-            anyhow::bail!("Order status request failed: {}", response.status());
-        }
-        let status: OrderStatus = response.json().await.context("Parse order status")?;
-        Ok(status)
-    }
-    
+       
     #[allow(dead_code)]
     async fn place_order_hmac(&self, order: &OrderRequest) -> Result<OrderResponse> {
         let path = "/orders";
@@ -1052,67 +723,4 @@ impl PolymarketApi {
         }
         Ok(redeem_response)
     }
-}
-
-// --- Chainlink BTC/USD price via Ethereum RPC (for price-to-beat) ---
-
-fn chainlink_latest_round_selector() -> [u8; 4] {
-    let h = keccak256(b"latestRoundData()");
-    [h[0], h[1], h[2], h[3]]
-}
-
-/// Fetch current BTC/USD price from Chainlink data feed via eth_call.
-/// Returns (price_usd, updated_at_unix_secs) or error description for logging.
-pub async fn get_chainlink_btc_price_usd(
-    client: &Client,
-    rpc_url: &str,
-    proxy_address: &str,
-) -> Result<(f64, u64), String> {
-    let to = proxy_address.trim_start_matches("0x");
-    let data = "0x".to_string() + &hex::encode(chainlink_latest_round_selector());
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "eth_call",
-        "params": [{"to": format!("0x{}", to), "data": &data}, "latest"],
-        "id": 1
-    });
-    let res = client
-        .post(rpc_url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {}", e))?;
-    let status = res.status();
-    let text = res.text().await.map_err(|e| format!("read body: {}", e))?;
-    let json: Value = serde_json::from_str(&text).map_err(|e| {
-        let body_preview = text.trim();
-        let preview = if body_preview.len() > 200 {
-            format!("{}...", &body_preview[..200])
-        } else {
-            body_preview.to_string()
-        };
-        format!("json parse: {}; status={}; body_len={}; body={:?}", e, status, text.len(), preview)
-    })?;
-    if let Some(err) = json.get("error") {
-        return Err(format!("RPC error: {}; status={}", err, status));
-    }
-    let hex_result = json
-        .get("result")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("no 'result' in response; keys={:?}", json.as_object().map(|o| o.keys().collect::<Vec<_>>())))?;
-    let hex_result = hex_result.strip_prefix("0x").unwrap_or(hex_result);
-    if hex_result.len() < 64 * 5 {
-        return Err(format!("result too short (need 320 hex chars): got {}", hex_result.len()));
-    }
-    let raw = hex::decode(hex_result).map_err(|e| format!("hex decode: {}", e))?;
-    let answer_slice = raw.get(32..64).ok_or_else(|| format!("raw len {}", raw.len()))?;
-    let answer = i128::from_be_bytes(
-        answer_slice[16..32]
-            .try_into()
-            .map_err(|_| "answer slice".to_string())?,
-    );
-    let price = (answer as f64) / 100_000_000.0;
-    let updated_slice = raw.get(96..128).ok_or("updatedAt slice")?;
-    let updated_at = u64::from_be_bytes(updated_slice[24..32].try_into().map_err(|_| "updatedAt bytes")?);
-    Ok((price, updated_at))
 }

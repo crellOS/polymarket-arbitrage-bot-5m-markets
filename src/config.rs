@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "Polymarket Soccer Trading Bot")]
 pub struct Args {
     #[arg(short, long, default_value = "config.json")]
     pub config: PathBuf,
@@ -21,79 +21,90 @@ pub struct Config {
     pub strategy: StrategyConfig,
 }
 
-/// 15m vs 5m arbitrage: trade overlap window; per-symbol price-to-beat tolerance (USD).
+/// Soccer match trading strategy: buy high-priced team + Draw when sum < threshold.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrategyConfig {
-    /// Symbols to arb (15m vs 5m overlap). e.g. ["btc", "eth", "sol", "xrp"].
-    #[serde(default = "default_symbols")]
-    pub symbols: Vec<String>,
-    /// Max sum of (15m one side ask + 5m opposite side ask) to trigger arb (e.g. 0.99).
-    #[serde(default = "default_sum_threshold")]
-    pub sum_threshold: f64,
-    /// Seconds to wait after placing an arb before placing the next one (cooldown).
-    #[serde(default = "default_trade_interval_secs")]
-    pub trade_interval_secs: u64,
+    /// Polymarket tag IDs for soccer leagues (e.g. 100977=UCL, 100350=soccer).
+    #[serde(default = "default_soccer_tag_ids")]
+    pub soccer_tag_ids: Vec<String>,
+    /// Interval in seconds to poll for soccer matches (e.g. 60–300).
+    #[serde(default = "default_market_poll_interval_secs")]
+    pub market_poll_interval_secs: u64,
+    /// Max event limit per tag when fetching matches.
+    #[serde(default = "default_market_fetch_limit")]
+    pub market_fetch_limit: u32,
+    /// Buy when (high_team_ask + draw_ask) < this (e.g. 0.95).
+    #[serde(default = "default_buy_threshold")]
+    pub buy_threshold: f64,
+    /// Trigger risk management when holding tokens' combined price drops by this fraction (e.g. 0.13 = 13%).
+    #[serde(default = "default_risk_reduce_threshold")]
+    pub risk_reduce_threshold: f64,
+    /// Sell both tokens for profit when combined price >= this (e.g. 0.99).
+    #[serde(default = "default_sell_profit_threshold")]
+    pub sell_profit_threshold: f64,
     #[serde(default)]
     pub simulation_mode: bool,
-    /// Size in shares per leg (15m and 5m).
-    #[serde(default = "default_arb_shares")]
-    pub arb_shares: String,
-    /// Per-symbol max |15m price-to-beat − 5m price-to-beat| (USD) to allow arb.
-    #[serde(default, alias = "price_to_beat_tolerance_usd")]
-    pub btc_price_to_beat_tolerance_usd: f64,
-    #[serde(default = "default_eth_tolerance")]
-    pub eth_price_to_beat_tolerance_usd: f64,
-    #[serde(default = "default_sol_tolerance")]
-    pub sol_price_to_beat_tolerance_usd: f64,
-    #[serde(default = "default_xrp_tolerance")]
-    pub xrp_price_to_beat_tolerance_usd: f64,
-    /// Seconds between polls when checking if markets are closed/resolved (e.g. 30).
-    #[serde(default = "default_resolution_poll_interval_secs")]
-    pub resolution_poll_interval_secs: u64,
-    /// Automatically redeem winning tokens after resolution.
-    #[serde(default = "default_auto_redeem")]
-    pub auto_redeem: bool,
+    /// Shares per leg when buying (team + draw).
+    #[serde(default = "default_shares")]
+    pub shares: String,
+    /// Seconds between placing trades (cooldown).
+    #[serde(default = "default_trade_interval_secs")]
+    pub trade_interval_secs: u64,
+    /// Path for caching fetched market data (JSON file).
+    #[serde(default = "default_market_cache_path")]
+    pub market_cache_path: String,
+    /// Interval in seconds to refresh market cache from API (e.g. 300 = 5 min).
+    #[serde(default = "default_market_refresh_interval_secs")]
+    pub market_refresh_interval_secs: u64,
+    /// Minutes after game start to consider match "live" (e.g. 135 = 2h15 for soccer).
+    #[serde(default = "default_live_window_minutes")]
+    pub live_window_minutes: i64,
+    /// Minutes before game_start to start match cycle (connect WS, get prices). Trading begins at game_start.
+    #[serde(default = "default_trading_start_minutes_before")]
+    pub trading_start_minutes_before: i64,
+    /// Max number of live markets to trade simultaneously (e.g. 1 or 2 to avoid overload).
+    #[serde(default = "default_max_concurrent_markets")]
+    pub max_concurrent_markets: u32,
 }
 
-fn default_symbols() -> Vec<String> {
-    vec!["btc".into(), "eth".into(), "sol".into(), "xrp".into()]
+fn default_soccer_tag_ids() -> Vec<String> {
+    vec!["100977".into(), "100350".into()] // UCL, soccer
 }
-fn default_sum_threshold() -> f64 {
+fn default_market_poll_interval_secs() -> u64 {
+    120 // 2 min
+}
+fn default_market_fetch_limit() -> u32 {
+    50
+}
+fn default_buy_threshold() -> f64 {
+    0.95
+}
+fn default_risk_reduce_threshold() -> f64 {
+    0.13
+}
+fn default_sell_profit_threshold() -> f64 {
     0.99
+}
+fn default_shares() -> String {
+    "100".to_string()
 }
 fn default_trade_interval_secs() -> u64 {
     60
 }
-fn default_arb_shares() -> String {
-    "10".to_string()
+fn default_market_cache_path() -> String {
+    "markets_cache.json".to_string()
 }
-fn default_eth_tolerance() -> f64 {
-    1.0
+fn default_market_refresh_interval_secs() -> u64 {
+    300 // 5 min
 }
-fn default_sol_tolerance() -> f64 {
-    0.05
+fn default_live_window_minutes() -> i64 {
+    135 // 2h15 for soccer (90 + stoppage + half)
 }
-fn default_xrp_tolerance() -> f64 {
-    0.0003
+fn default_trading_start_minutes_before() -> i64 {
+    5 // Enter match cycle 5 min before kickoff so we're ready at game_start
 }
-fn default_resolution_poll_interval_secs() -> u64 {
-    20
-}
-fn default_auto_redeem() -> bool {
-    true
-}
-
-impl StrategyConfig {
-    /// Price-to-beat tolerance (USD) for the given symbol.
-    pub fn price_to_beat_tolerance_for(&self, symbol: &str) -> f64 {
-        match symbol.to_lowercase().as_str() {
-            "btc" => self.btc_price_to_beat_tolerance_usd,
-            "eth" => self.eth_price_to_beat_tolerance_usd,
-            "sol" => self.sol_price_to_beat_tolerance_usd,
-            "xrp" => self.xrp_price_to_beat_tolerance_usd,
-            _ => 0.0,
-        }
-    }
+fn default_max_concurrent_markets() -> u32 {
+    1 // Trade one market at a time by default
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,23 +117,14 @@ pub struct PolymarketConfig {
     pub private_key: Option<String>,
     pub proxy_wallet_address: Option<String>,
     pub signature_type: Option<u8>,
-    /// Polygon RPC URL for redemption (Safe reads + sendTransaction). Defaults to polygon-rpc.com if unset.
     #[serde(default)]
     pub rpc_url: Option<String>,
-    /// WebSocket base URL for market channel (e.g. wss://ws-subscriptions-clob.polymarket.com).
     #[serde(default = "default_ws_url")]
     pub ws_url: String,
-    /// RTDS WebSocket URL for Chainlink BTC price (price-to-beat). Topic: crypto_prices_chainlink, symbol: btc/usd.
-    #[serde(default = "default_rtds_ws_url")]
-    pub rtds_ws_url: String,
 }
 
 fn default_ws_url() -> String {
     "wss://ws-subscriptions-clob.polymarket.com".to_string()
-}
-
-fn default_rtds_ws_url() -> String {
-    "wss://ws-live-data.polymarket.com".to_string()
 }
 
 impl Default for Config {
@@ -139,20 +141,22 @@ impl Default for Config {
                 signature_type: None,
                 rpc_url: None,
                 ws_url: default_ws_url(),
-                rtds_ws_url: default_rtds_ws_url(),
             },
             strategy: StrategyConfig {
-                symbols: default_symbols(),
-                sum_threshold: 0.99,
-                trade_interval_secs: default_trade_interval_secs(),
+                soccer_tag_ids: default_soccer_tag_ids(),
+                market_poll_interval_secs: default_market_poll_interval_secs(),
+                market_fetch_limit: default_market_fetch_limit(),
+                buy_threshold: default_buy_threshold(),
+                risk_reduce_threshold: default_risk_reduce_threshold(),
+                sell_profit_threshold: default_sell_profit_threshold(),
                 simulation_mode: false,
-                arb_shares: default_arb_shares(),
-                btc_price_to_beat_tolerance_usd: 10.0,
-                eth_price_to_beat_tolerance_usd: default_eth_tolerance(),
-                sol_price_to_beat_tolerance_usd: default_sol_tolerance(),
-                xrp_price_to_beat_tolerance_usd: default_xrp_tolerance(),
-                resolution_poll_interval_secs: default_resolution_poll_interval_secs(),
-                auto_redeem: default_auto_redeem(),
+                shares: default_shares(),
+                trade_interval_secs: default_trade_interval_secs(),
+                market_cache_path: default_market_cache_path(),
+                market_refresh_interval_secs: default_market_refresh_interval_secs(),
+                live_window_minutes: default_live_window_minutes(),
+                trading_start_minutes_before: default_trading_start_minutes_before(),
+                max_concurrent_markets: default_max_concurrent_markets(),
             },
         }
     }

@@ -1,9 +1,7 @@
 mod api;
-mod chainlink;
 mod config;
-mod discovery;
 mod models;
-mod rtds;
+mod soccer;
 mod strategy;
 mod ws;
 
@@ -13,7 +11,7 @@ use config::{Args, Config};
 use std::io::Write;
 use std::sync::Arc;
 use api::PolymarketApi;
-use strategy::ArbStrategy;
+use strategy::SoccerStrategy;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,8 +24,9 @@ async fn main() -> Result<()> {
     let config = Config::load(&args.config)?;
 
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    eprintln!("📋 15m vs 5m arbitrage (BTC, ETH, SOL, XRP) — overlap, per-symbol tolerance");
-    eprintln!("   All symbols via parallel WebSocket; arb when sum < threshold & |P15−P5| ≤ tolerance");
+    eprintln!("⚽ Polymarket Soccer Trading Bot");
+    eprintln!("   Buy team + Draw when sum < threshold; monitor via WebSocket");
+    eprintln!("   Risk mgmt: sell team + buy opposite on price drop | Profit: sell both when sum >= 0.99");
     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let api = Arc::new(PolymarketApi::new(
@@ -56,7 +55,7 @@ async fn main() -> Result<()> {
         log::warn!("⚠️ No private key provided. Bot can only monitor (no orders).");
     }
 
-    let strategy = ArbStrategy::new(api, config);
+    let strategy = SoccerStrategy::new(api, config);
     strategy.run().await
 }
 
@@ -95,7 +94,7 @@ async fn run_redeem_only(
     let mut fail_count = 0u32;
     for cid in &cids {
         eprintln!("\n--- Redeeming condition {} ---", &cid[..cid.len().min(18)]);
-        match api.redeem_tokens(cid, "", "Up").await {
+        match api.redeem_tokens(cid, "", "Yes").await {
             Ok(_) => {
                 eprintln!("Success: {}", cid);
                 ok_count += 1;
