@@ -34,7 +34,12 @@ sol! {
     }
 }
 
-
+sol! {
+    interface IERC20 {
+        function balanceOf(address account) external view returns (uint256);
+        function allowance(address owner, address spender) external view returns (uint256);
+    }
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -353,6 +358,64 @@ impl PolymarketApi {
             );
         }
     }
+
+    /// Fetch best ask price for a token from CLOB order book (for market filtering).
+    /// Polymarket CLOB returns asks in DESCENDING order (0.99 first). Best ask = lowest price = min.
+    /// When best ask is 0.99 (placeholder/empty), we try last_trade_price; if absent/placeholder, return None.
+    pub async fn get_best_ask(&self, token_id: &str) -> Result<Option<f64>> {
+        let url = format!("{}/book", self.clob_url);
+        let response = self.client
+            .get(&url)
+            .query(&[("token_id", token_id)])
+            .send()
+            .await
+            .context("Failed to fetch order book")?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let json: Value = response.json().await.unwrap_or(Value::Null);
+        let asks = json.get("asks").and_then(|a| a.as_array());
+        // CLOB returns asks descending (0.99 first). Best ask = minimum price.
+        let best_ask = asks.and_then(|arr| {
+            arr.iter()
+                .filter_map(|o| o.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()))
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        // Placeholder when book is empty: bid ~0.01, ask ~0.99. Use last_trade_price as fallback.
+        if best_ask.map(|a| a > 0.95).unwrap_or(false) {
+            let last = json.get("last_trade_price")
+                .and_then(|p| p.as_str())
+                .and_then(|s| s.parse::<f64>().ok());
+            // Prefer last_trade_price if it looks like a real price (not placeholder)
+            if let Some(ltp) = last {
+                if (0.02..=0.98).contains(&ltp) {
+                    return Ok(Some(ltp));
+                }
+            }
+            return Ok(None); // Placeholder ask, no usable fallback
+        }
+        Ok(best_ask)
+    }
+
+    /// Fetch order status for fill verification. Returns None if order not found or API error.
+    pub async fn get_order_status(&self, order_id: &str) -> Result<Option<OrderStatusResponse>> {
+        if self.api_key.is_none() || self.api_secret.is_none() || self.api_passphrase.is_none() {
+            return Ok(None);
+        }
+        let path = format!("/order/{}", order_id);
+        let url = format!("{}{}", self.clob_url, path);
+        let mut request = self.client.get(&url);
+        request = self.add_auth_headers(request, "GET", &path, "")
+            .context("Failed to add auth headers")?;
+        let response = request.send().await.context("Failed to fetch order status")?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let status: OrderStatusResponse = response.json().await
+            .context("Failed to parse order status")?;
+        Ok(Some(status))
+    }
        
     #[allow(dead_code)]
     async fn place_order_hmac(&self, order: &OrderRequest) -> Result<OrderResponse> {
@@ -394,6 +457,110 @@ impl PolymarketApi {
 
         eprintln!("✅ Order placed successfully: {:?}", order_response);
         Ok(order_response)
+    }
+
+    /// Get the effective trading wallet address (proxy or EOA). Used for balance/positions queries.
+    pub fn get_trading_wallet(&self) -> Result<String> {
+        if let Some(addr) = &self.proxy_wallet_address {
+            return Ok(addr.clone());
+        }
+        let pk = self.private_key.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No proxy_wallet_address or private_key for wallet lookup"))?;
+        let signer = LocalSigner::from_str(pk)
+            .context("Failed to parse private key for wallet")?
+            .with_chain_id(Some(POLYGON));
+        Ok(format!("{:?}", signer.address()))
+    }
+
+    /// Fetch USDC balance and allowance for the trading wallet from chain.
+    /// Spender: CTF Exchange 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E.
+    pub async fn get_balance_allowance(&self, wallet: &str) -> Result<BalanceAllowance> {
+        const USDC: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+        const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+        let rpc_url = self.rpc_url.as_deref().unwrap_or("https://polygon-rpc.com");
+        let parse_addr = |s: &str| -> Result<Address> {
+            let h = s.strip_prefix("0x").unwrap_or(s);
+            let bytes = hex::decode(h).context("Invalid hex")?;
+            let arr: [u8; 20] = bytes.try_into().map_err(|_| anyhow::anyhow!("Address must be 20 bytes"))?;
+            Ok(Address::from(arr))
+        };
+        let usdc_addr = parse_addr(USDC)?;
+        let exchange_addr = parse_addr(CTF_EXCHANGE)?;
+        let owner = parse_addr(wallet)?;
+
+        let provider = ProviderBuilder::new().connect(rpc_url).await
+            .context("Failed to connect to RPC")?;
+
+        let balance_of_selector = keccak256("balanceOf(address)".as_bytes()).as_slice()[..4].to_vec();
+        let mut balance_calldata = Vec::with_capacity(4 + 32);
+        balance_calldata.extend_from_slice(&balance_of_selector);
+        balance_calldata.extend_from_slice(&[0u8; 12]);
+        balance_calldata.extend_from_slice(owner.as_slice());
+        let balance_tx = TransactionRequest::default()
+            .to(usdc_addr)
+            .input(Bytes::from(balance_calldata).into());
+        let balance_res = provider.call(balance_tx).await
+            .context("Failed to call balanceOf")?;
+        let balance_u256 = U256::from_be_slice(balance_res.as_ref());
+
+        let allowance_sig = "allowance(address,address)";
+        let allowance_selector = keccak256(allowance_sig.as_bytes()).as_slice()[..4].to_vec();
+        let mut allowance_calldata = Vec::with_capacity(4 + 32 + 32);
+        allowance_calldata.extend_from_slice(&allowance_selector);
+        allowance_calldata.extend_from_slice(&[0u8; 12]);
+        allowance_calldata.extend_from_slice(owner.as_slice());
+        allowance_calldata.extend_from_slice(&[0u8; 12]);
+        allowance_calldata.extend_from_slice(exchange_addr.as_slice());
+        let allowance_tx = TransactionRequest::default()
+            .to(usdc_addr)
+            .input(Bytes::from(allowance_calldata).into());
+        let allowance_res = provider.call(allowance_tx).await
+            .context("Failed to call allowance")?;
+        let allowance_u256 = U256::from_be_slice(allowance_res.as_ref());
+
+        // USDC has 6 decimals. Cap at u64::MAX to avoid overflow when allowance is type(uint256).max (unlimited)
+        let u64_max_u256 = U256::from(u64::MAX);
+        let to_u64_safe = |v: U256| -> u64 {
+            if v > u64_max_u256 { u64::MAX } else { v.to::<u64>() }
+        };
+        let balance_usdc = (to_u64_safe(balance_u256) as f64) / 1_000_000.0;
+        let allowance_usdc = (to_u64_safe(allowance_u256) as f64) / 1_000_000.0;
+        Ok(BalanceAllowance { balance_usdc, allowance_usdc })
+    }
+
+    /// Fetch all positions for a wallet (not just redeemable). Used for holding stats and monitoring.
+    pub async fn get_all_positions(&self, wallet: &str) -> Result<Vec<Position>> {
+        let url = "https://data-api.polymarket.com/positions";
+        let user = if wallet.starts_with("0x") {
+            wallet.to_string()
+        } else {
+            format!("0x{}", wallet)
+        };
+        let response = self.client
+            .get(url)
+            .query(&[("user", user.as_str()), ("limit", "500")])
+            .send()
+            .await
+            .context("Failed to fetch positions")?;
+        if !response.status().is_success() {
+            anyhow::bail!("Data API returned {} for positions", response.status());
+        }
+        let raw: Vec<Value> = response.json().await.unwrap_or_default();
+        let positions: Vec<Position> = raw
+            .into_iter()
+            .filter_map(|p| {
+                let size = p.get("size")
+                    .and_then(|s| s.as_f64())
+                    .or_else(|| p.get("size").and_then(|s| s.as_u64().map(|u| u as f64)))
+                    .or_else(|| p.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()));
+                if size.map(|s| s > 0.0).unwrap_or(false) {
+                    serde_json::from_value(p).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(positions)
     }
 
     pub async fn get_redeemable_positions(&self, wallet: &str) -> Result<Vec<String>> {

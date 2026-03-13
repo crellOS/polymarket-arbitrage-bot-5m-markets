@@ -154,8 +154,9 @@ async fn process_message(text: &str, prices: &PricesSnapshot) -> Result<()> {
 
     if event_type == Some("book") {
         let book: WsBookMessage = serde_json::from_value(v).context("Parse book")?;
-        let bid = book.buys.first().and_then(|b| parse_f64(&b.price));
-        let ask = book.sells.first().and_then(|a| parse_f64(&a.price));
+        // Best bid = highest buy price; best ask = lowest sell price (CLOB may send descending)
+        let bid = book.buys.iter().filter_map(|b| parse_f64(&b.price)).max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let ask = book.sells.iter().filter_map(|a| parse_f64(&a.price)).min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if (bid.is_some() || ask.is_some()) && !is_placeholder_quote(bid, ask) {
             let mut w = prices.write().await;
             let entry = w.entry(book.asset_id).or_default();

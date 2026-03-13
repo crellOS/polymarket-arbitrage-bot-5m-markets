@@ -62,9 +62,16 @@ pub struct StrategyConfig {
     /// Minutes before game_start to start match cycle (connect WS, get prices). Trading begins at game_start.
     #[serde(default = "default_trading_start_minutes_before")]
     pub trading_start_minutes_before: i64,
+    /// For live matches: only consider if at least N minutes into the game (0 = from kickoff).
+    /// Set to 45 to require game_start at least 45 mins before now (skip first 45 min).
+    #[serde(default = "default_min_minutes_into_game")]
+    pub min_minutes_into_game: i64,
     /// Max number of live markets to trade simultaneously (e.g. 1 or 2 to avoid overload).
     #[serde(default = "default_max_concurrent_markets")]
     pub max_concurrent_markets: u32,
+    /// Number of nearest upcoming matches to display when no live matches (e.g. 5).
+    #[serde(default = "default_nearest_upcoming_count")]
+    pub nearest_upcoming_count: usize,
 }
 
 fn default_soccer_tag_ids() -> Vec<String> {
@@ -103,8 +110,14 @@ fn default_live_window_minutes() -> i64 {
 fn default_trading_start_minutes_before() -> i64 {
     5 // Enter match cycle 5 min before kickoff so we're ready at game_start
 }
+fn default_min_minutes_into_game() -> i64 {
+    0 // 0 = from kickoff; 45 = skip first 45 min (require game_start at least 45 mins before now)
+}
 fn default_max_concurrent_markets() -> u32 {
     1 // Trade one market at a time by default
+}
+fn default_nearest_upcoming_count() -> usize {
+    5
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,7 +169,9 @@ impl Default for Config {
                 market_refresh_interval_secs: default_market_refresh_interval_secs(),
                 live_window_minutes: default_live_window_minutes(),
                 trading_start_minutes_before: default_trading_start_minutes_before(),
+                min_minutes_into_game: default_min_minutes_into_game(),
                 max_concurrent_markets: default_max_concurrent_markets(),
+                nearest_upcoming_count: default_nearest_upcoming_count(),
             },
         }
     }

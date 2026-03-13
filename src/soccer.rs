@@ -130,8 +130,9 @@ impl SoccerDiscovery {
     ) -> Result<Vec<SoccerMatch>> {
         let mut all_matches = Vec::new();
         for tag_id in tag_ids {
+            // Don't filter by closed=false: Polymarket may mark events closed at kickoff.
             let url = format!(
-                "{}/events?tag_id={}&active=true&closed=false&limit={}",
+                "{}/events?tag_id={}&active=true&limit={}",
                 self.api.gamma_url(),
                 tag_id,
                 limit
@@ -148,7 +149,7 @@ impl SoccerDiscovery {
                 }
             }
         }
-        // Exclude matches that have already ended (game_start + live_window < now)
+        // Exclude matches that have already ended (now < game_start + live_window)
         let now = Utc::now();
         let window = chrono::Duration::minutes(live_window_minutes);
         all_matches.retain(|m| {
@@ -202,7 +203,7 @@ impl SoccerDiscovery {
         live_window_minutes: i64,
         trading_start_minutes_before: i64,
     ) -> Option<&'a SoccerMatch> {
-        self.select_live_matches(matches, live_window_minutes, trading_start_minutes_before, 1)
+        self.select_live_matches(matches, live_window_minutes, trading_start_minutes_before, 0, 1)
             .into_iter()
             .next()
     }
@@ -213,17 +214,24 @@ impl SoccerDiscovery {
         matches: &'a [SoccerMatch],
         live_window_minutes: i64,
         trading_start_minutes_before: i64,
+        min_minutes_into_game: i64,
         limit: usize,
     ) -> Vec<&'a SoccerMatch> {
         let now = Utc::now();
         let window = chrono::Duration::minutes(live_window_minutes);
         let pre = chrono::Duration::minutes(trading_start_minutes_before);
+        let min_in = chrono::Duration::minutes(min_minutes_into_game);
+        // Include matches in the live window. Don't filter by !closed: Polymarket may mark events
+        // closed at kickoff even when in-play trading is still open.
+        // For live matches (now > gs): require now >= gs + min_minutes_into_game (skip first N min if set).
         let mut live: Vec<_> = matches
             .iter()
-            .filter(|m| m.active && !m.closed)
+            .filter(|m| m.active)
             .filter(|m| {
                 m.game_start.map(|gs| {
-                    now >= gs - pre && now <= gs + window
+                    let in_window = now >= gs - pre && now <= gs + window;
+                    let past_min = min_minutes_into_game == 0 || now <= gs || now >= gs + min_in;
+                    in_window && past_min
                 }).unwrap_or(false)
             })
             .collect();
@@ -233,6 +241,21 @@ impl SoccerDiscovery {
             a_end.cmp(&b_end)
         });
         live.into_iter().take(limit).collect()
+    }
+
+    /// Select up to `limit` nearest upcoming matches (game_start > now), sorted by game_start.
+    pub fn select_nearest_upcoming<'a>(
+        &self,
+        matches: &'a [SoccerMatch],
+        limit: usize,
+    ) -> Vec<&'a SoccerMatch> {
+        let now = Utc::now();
+        matches
+            .iter()
+            .filter(|m| m.active && !m.closed)
+            .filter(|m| m.game_start.map(|gs| now < gs).unwrap_or(false))
+            .take(limit)
+            .collect()
     }
 
     fn parse_match_event(ev: GammaEvent) -> Option<SoccerMatch> {

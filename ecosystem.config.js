@@ -2,7 +2,7 @@ module.exports = {
   apps: [{
     name: 'polymarket-bot',
     script: './target/release/polymarket-arbitrage-bot',
-    cwd: '/root/rust-pro/polymarket-trading-bot-btc-5m-market',
+    cwd: '/root/rust-pro/polymarket-trading-bot-sports-soccer',
     instances: 1,
     autorestart: true,
     watch: false,
